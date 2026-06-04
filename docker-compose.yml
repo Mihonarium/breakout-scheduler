@@ -1,0 +1,41 @@
+services:
+  app:
+    build: .
+    image: breakout-scheduler:latest
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # CHANGE THIS: signs auth/CSRF cookies. Generate with `openssl rand -hex 32`.
+      SECRET_KEY: "change-me-to-a-long-random-string"
+      DB_PATH: /data/app.db
+      BACKUP_DIR: /data/backups
+      BACKUP_INTERVAL_S: "300"
+      PREVIEW_INTERVAL_S: "3"
+      # Optional: require this code to create the FIRST event, then it's disabled.
+      # BOOTSTRAP_ADMIN_CODE: "set-once-secret"
+      # Set to 1 only for a schedule-changing redeploy (runs Alembic; back up first).
+      # RUN_MIGRATIONS: "0"
+    volumes:
+      - breakout-data:/data
+
+  # Optional: expose the app at a public hostname via Cloudflare Tunnel.
+  # Token-based + dashboard-managed: create a tunnel in Cloudflare Zero Trust,
+  # add a public hostname mapping it to service http://app:8000, copy the tunnel
+  # token, and run with CF_TUNNEL_TOKEN set. No ports need to be published on the
+  # host, and no account-wide credentials are involved. Start with:
+  #   CF_TUNNEL_TOKEN=... docker compose --profile tunnel up -d
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: "${CF_TUNNEL_TOKEN:?set CF_TUNNEL_TOKEN to your tunnel token}"
+    depends_on:
+      - app
+
+volumes:
+  # Persists the SQLite DB + backups across redeploys. Back this up:
+  #   docker compose exec app python -c "import sqlite3; sqlite3.connect('/data/app.db').execute('VACUUM INTO \"/data/backups/manual.db\"')"
+  breakout-data:

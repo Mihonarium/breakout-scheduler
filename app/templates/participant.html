@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Rate — {{ event.name }}{% endblock %}
+{% block page %}participant{% endblock %}
+{% block content %}
+<div class="phone">
+  {% if collecting %}
+    <div class="banner live">● <b>{{ collecting.name }}</b> — rating open</div>
+  {% elif published %}
+    <div class="banner done">✓ <b>{{ published.name }}</b> published — <a href="/published">go to your session →</a></div>
+  {% else %}
+    <div class="banner">Waiting for the organizer to open a round.</div>
+  {% endif %}
+
+  <form class="propose" method="post" action="/propose"
+        hx-post="/propose" hx-target="#rate-list" hx-swap="outerHTML"
+        hx-on::after-request="if (event.detail.successful) this.reset()">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input name="title" placeholder="Propose a breakout…" required maxlength="200" autocomplete="off">
+    <button class="btn primary" type="submit" aria-label="Add proposal">＋</button>
+    <details class="propose-opts">
+      <summary>session options</summary>
+      <div class="opt-grid">
+        {% if event.descriptions_enabled %}
+        <label class="opt-desc">Description <span class="tiny dim">(optional)</span>
+          <textarea name="description" rows="2" maxlength="1000" placeholder="A sentence on what it's about…"></textarea></label>
+        {% endif %}
+        <label>Only run if at least
+          <input name="min_attendees" type="number" min="1" max="999" inputmode="numeric" placeholder="—"> people want it</label>
+        <label>Cap attendance at
+          <input name="max_attendees" type="number" min="1" max="999" inputmode="numeric" placeholder="—"> people <span class="tiny dim">(small workshops)</span></label>
+        <label class="opt-check"><input type="checkbox" name="no_room" value="1"> No room needed <span class="tiny dim">(happens elsewhere — a walk, the lawn…)</span></label>
+        <label class="opt-check"><input type="checkbox" name="anonymous" value="1"> Propose anonymously <span class="tiny dim">(hide my name)</span></label>
+      </div>
+    </details>
+  </form>
+
+  {% include "_rate_list.html" %}
+</div>
+{% endblock %}

@@ -1,0 +1,205 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
+log = logging.getLogger("breakouts")
+
+from fastapi import FastAPI, Request
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+from app.config import Settings, load_settings
+from app.db import make_engine, make_session_factory
+from app.models import Base
+from app.services.preview import PreviewCache
+from app.services.backup import backup_once
+from app.ratelimit import Limiter
+
+TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "templates")
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+
+
+def _preview_loop(app: FastAPI):
+    from app.services.rounds import solve_round
+    state = app.state
+
+    def solve(round_id: int):
+        s = state.session_factory()
+        try:
+            return solve_round(s, round_id)
+        finally:
+            s.close()
+
+    async def loop():
+        while True:
+            try:
+                # solve OFF the event loop — CP-SAT is blocking (up to MAX_TIME_S)
+                await asyncio.to_thread(state.preview_cache.refresh_due,
+                                        time.monotonic(), solve)
+            except Exception:  # never let the loop die on one bad solve — but log it
+                log.exception("preview solve loop iteration failed")
+            await asyncio.sleep(state.settings.preview_interval_s)
+    return loop
+
+
+def _session_alert_loop(app: FastAPI):
+    """Push a heads-up a few minutes before a running slot ends (≈ before the next
+    session starts). Starts are manual, so 'before it starts' = 'current ending soon'."""
+    from sqlalchemy import select
+    from app.models import Timeslot, Round
+    from app.services import push as PUSH
+    from datetime import datetime, timezone, timedelta
+    state = app.state
+
+    def scan():
+        if not state.settings.push_enabled:
+            return
+        lead = state.settings.alert_lead_minutes
+        s = state.session_factory()
+        try:
+            now = datetime.now(timezone.utc)
+            for ts in s.scalars(select(Timeslot).where(Timeslot.started_at.is_not(None))):
+                if ts.id in state.session_alert_sent:
+                    continue
+                start = ts.started_at if ts.started_at.tzinfo else ts.started_at.replace(tzinfo=timezone.utc)
+                end = start + timedelta(minutes=ts.duration_minutes or 0)
+                if not (end - timedelta(minutes=lead) <= now < end):
+                    continue
+                try:
+                    rnd = s.get(Round, ts.round_id)
+                    if rnd and rnd.status == "published":
+                        PUSH.notify_round(state.session_factory, state.settings, ts.round_id,
+                                          f"{ts.name} ends in ~{lead} min",
+                                          "Wrap up — the next session is starting soon.")
+                    # mark sent only AFTER a successful send, so a failed push is
+                    # retried next tick instead of being permanently suppressed.
+                    state.session_alert_sent.add(ts.id)
+                except Exception:
+                    log.exception("session alert failed for timeslot %s", ts.id)
+        finally:
+            s.close()
+
+    async def loop():
+        while True:
+            try:
+                await asyncio.to_thread(scan)
+            except Exception:
+                log.exception("session alert loop iteration failed")
+            await asyncio.sleep(30)
+    return loop
+
+
+def _backup_loop(app: FastAPI):
+    state = app.state
+
+    async def loop():
+        while True:
+            await asyncio.sleep(state.settings.backup_interval_s)
+            try:
+                if state.settings.db_path != ":memory:" and os.path.exists(state.settings.db_path):
+                    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+                    backup_once(state.settings.db_path, state.settings.backup_dir, stamp)
+            except Exception:
+                log.exception("backup failed")  # don't fail silently — operators rely on this
+    return loop
+
+
+_DEFAULT_SECRET = "dev-insecure-key-change-me"
+# Known placeholder keys that must never reach production. A publicly-known signing
+# key lets anyone forge an admin cookie. (Length isn't checked here so an existing
+# short-but-private deploy key keeps working — rotating it would void live logins.)
+_PLACEHOLDER_SECRETS = {_DEFAULT_SECRET, "change-me-to-a-long-random-string"}
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or load_settings()
+    # Fail fast if shipped to prod with a known placeholder secret (cookies forgeable)
+    if settings.secret_key in _PLACEHOLDER_SECRETS and (settings.cookie_secure or settings.base_url):
+        raise RuntimeError("Set SECRET_KEY: refusing to start in production with a placeholder key.")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        tasks = [asyncio.create_task(_preview_loop(app)()),
+                 asyncio.create_task(_session_alert_loop(app)()),
+                 asyncio.create_task(_backup_loop(app)())]
+        try:
+            yield
+        finally:
+            for t in tasks:
+                t.cancel()
+
+    app = FastAPI(title="Breakout Scheduler", lifespan=lifespan)
+
+    if settings.db_path not in (":memory:",) and os.path.dirname(settings.db_path):
+        os.makedirs(os.path.dirname(settings.db_path), exist_ok=True)
+    engine = make_engine(settings.db_path)
+    # Gated migrations: run Alembic only when explicitly asked (after a backup);
+    # otherwise create_all for fresh DBs / dev. Schema-changing redeploys set
+    # RUN_MIGRATIONS=1 and are NOT the "~1s restart" path.
+    if os.environ.get("RUN_MIGRATIONS") == "1":
+        from alembic import command
+        from alembic.config import Config as AlembicConfig
+        cfg = AlembicConfig(os.path.join(os.path.dirname(os.path.dirname(__file__)), "alembic.ini"))
+        os.environ["DB_PATH"] = settings.db_path
+        command.upgrade(cfg, "head")
+    else:
+        Base.metadata.create_all(engine)
+
+    app.state.settings = settings
+    app.state.engine = engine
+    app.state.session_factory = make_session_factory(engine)
+    app.state.preview_cache = PreviewCache(settings.preview_interval_s)
+    app.state.limiter = Limiter()
+    app.state.session_alert_sent = set()  # timeslot ids already warned (this process)
+    app.state.eval_cache = {}  # round_id -> (fingerprint, Result) for the console grid
+    templates = Jinja2Templates(directory=TEMPLATES_DIR)
+    import json as _json
+    templates.env.filters["fromjson"] = _json.loads
+
+    def _utciso(dt):
+        # stored datetimes come back from SQLite naive but are UTC; emit an explicit
+        # offset so the browser doesn't misparse the countdown as local time.
+        if dt is None:
+            return ""
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    templates.env.filters["utciso"] = _utciso
+    app.state.templates = templates
+    app.state.bootstrap_used = False
+
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    from fastapi import Request as _Request
+    from fastapi.responses import JSONResponse
+
+    @app.exception_handler(ValueError)
+    async def _value_error(_req: _Request, exc: ValueError):
+        # service-layer validation errors -> 400, not a raw 500
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @app.get("/healthz")
+    def healthz():
+        return {"status": "ok"}
+
+    from fastapi.responses import FileResponse
+
+    @app.get("/sw.js")
+    def service_worker():
+        # served at root so the SW scope covers the whole app
+        return FileResponse(os.path.join(STATIC_DIR, "sw.js"),
+                            media_type="application/javascript",
+                            headers={"Service-Worker-Allowed": "/", "Cache-Control": "no-cache"})
+
+    from app.routers import events, participant, admin, push
+    app.include_router(events.router)
+    app.include_router(participant.router)
+    app.include_router(admin.router)
+    app.include_router(push.router)
+
+    return app
